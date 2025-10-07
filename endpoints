@@ -1,0 +1,214 @@
+# nexus/nexus_base/a2a_api.py
+"""
+FastAPI endpoints for A2A Protocol integration
+"""
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, BackgroundTasks
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from typing import Dict, List, Optional, Any
+import asyncio
+import json
+import logging
+from datetime import datetime
+
+# Import the A2A manager
+from nexus.nexus_base.a2a_manager import extend_nexus_with_a2a, A2AAgentCard
+
+
+# Pydantic models for API
+class A2AMessage(BaseModel):
+    type: str = Field(default="chat", description="Message type: chat, action, query")
+    content: Optional[str] = Field(None, description="Message content")
+    action: Optional[str] = Field(None, description="Action name for action type")
+    parameters: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Action parameters")
+    query_type: Optional[str] = Field(None, description="Query type for query messages")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional metadata")
+
+
+class A2ANetworkRequest(BaseModel):
+    agents: List[str] = Field(..., description="List of agent names to include in network")
+    network_id: Optional[str] = Field(None, description="Optional network ID")
+
+
+class A2AWorkflowStep(BaseModel):
+    id: str = Field(..., description="Step ID")
+    agent: str = Field(..., description="Agent to execute this step")
+    message: A2AMessage = Field(..., description="Message to send to agent")
+    depends_on: List[str] = Field(default_factory=list, description="Step dependencies")
+
+
+class A2AWorkflow(BaseModel):
+    id: str = Field(..., description="Workflow ID")
+    steps: List[A2AWorkflowStep] = Field(..., description="Workflow steps")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Workflow metadata")
+
+
+class A2ADiscoveryQuery(BaseModel):
+    capabilities: Optional[List[str]] = Field(None, description="Required capabilities")
+    name_pattern: Optional[str] = Field(None, description="Name pattern to match")
+
+
+class ExternalAgentConnection(BaseModel):
+    agent_url: str = Field(..., description="URL of external agent")
+    agent_card: Dict[str, Any] = Field(..., description="Agent card information")
+
+
+def create_a2a_router(nexus_instance):
+    """Create FastAPI router with A2A endpoints"""
+    
+    # Extend Nexus with A2A capabilities
+    nexus = extend_nexus_with_a2a(nexus_instance)
+    
+    # Create router
+    from fastapi import APIRouter
+    router = APIRouter(prefix="/a2a", tags=["A2A Protocol"])
+    
+    # Store active WebSocket connections
+    active_connections: Dict[str, WebSocket] = {}
+    
+    @router.on_event("startup")
+    async def startup_event():
+        """Initialize A2A services on startup"""
+        try:
+            # Register all agents
+            await nexus.register_a2a_agents()
+            # Start A2A server
+            await nexus.start_a2a_server()
+            logging.info("A2A services initialized")
+        except Exception as e:
+            logging.error(f"Failed to initialize A2A services: {e}")
+    
+    @router.on_event("shutdown")
+    async def shutdown_event():
+        """Clean up A2A services on shutdown"""
+        try:
+            await nexus.stop_a2a_server()
+            logging.info("A2A services stopped")
+        except Exception as e:
+            logging.error(f"Error stopping A2A services: {e}")
+    
+    @router.get("/agents", response_model=List[Dict[str, Any]])
+    async def list_agents():
+        """List all registered A2A agents with their cards"""
+        try:
+            agents = []
+            for agent_name in nexus.get_agent_names():
+                card = nexus.get_agent_card(agent_name)
+                if card:
+                    agents.append(card.to_dict())
+            return agents
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @router.get("/agents/{agent_name}/card", response_model=Dict[str, Any])
+    async def get_agent_card(agent_name: str):
+        """Get A2A agent card for a specific agent"""
+        card = nexus.get_agent_card(agent_name)
+        if not card:
+            raise HTTPException(status_code=404, detail=f"Agent {agent_name} not found")
+        return card.to_dict()
+    
+    @router.post("/agents/{agent_name}/chat")
+    async def chat_with_agent(agent_name: str, message: A2AMessage):
+        """Send a message to an agent using A2A protocol"""
+        try:
+            response = await nexus.handle_a2a_request(agent_name, message.dict())
+            return response
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @router.post("/agents/{agent_name}/stream")
+    async def stream_agent_response(agent_name: str, message: A2AMessage):
+        """Stream agent response using Server-Sent Events"""
+        async def generate():
+            try:
+                async for chunk in nexus.stream_a2a_response(agent_name, message.content):
+                    yield f"data: {json.dumps(chunk)}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        
+        return StreamingResponse(generate(), media_type="text/event-stream")
+    
+    @router.websocket("/agents/{agent_name}/ws")
+    async def websocket_agent_chat(websocket: WebSocket, agent_name: str):
+        """WebSocket endpoint for real-time agent communication"""
+        await websocket.accept()
+        connection_id = f"{agent_name}-{datetime.now().timestamp()}"
+        active_connections[connection_id] = websocket
+        
+        try:
+            while True:
+                # Receive message from client
+                data = await websocket.receive_text()
+                message = json.loads(data)
+                
+                # Handle the message
+                if message.get("stream", False):
+                    # Stream response
+                    async for chunk in nexus.stream_a2a_response(agent_name, message.get("content", "")):
+                        await websocket.send_text(json.dumps(chunk))
+                else:
+                    # Regular response
+                    response = await nexus.handle_a2a_request(agent_name, message)
+                    await websocket.send_text(json.dumps(response))
+                    
+        except WebSocketDisconnect:
+            del active_connections[connection_id]
+            logging.info(f"WebSocket disconnected: {connection_id}")
+        except Exception as e:
+            logging.error(f"WebSocket error: {e}")
+            del active_connections[connection_id]
+    
+    @router.post("/discover")
+    async def discover_agents(query: Optional[A2ADiscoveryQuery] = None):
+        """Discover available A2A agents based on query"""
+        try:
+            query_dict = query.dict() if query else None
+            agents = await nexus.discover_a2a_agents(query_dict)
+            return [agent.to_dict() for agent in agents]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @router.post("/connect")
+    async def connect_external_agent(connection: ExternalAgentConnection):
+        """Connect to an external A2A agent"""
+        try:
+            success = await nexus.connect_external_agent(
+                connection.agent_url,
+                connection.agent_card
+            )
+            if success:
+                return {"status": "connected", "agent_url": connection.agent_url}
+            else:
+                raise HTTPException(status_code=400, detail="Failed to connect to external agent")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @router.post("/networks", response_model=Dict[str, Any])
+    async def create_network(request: A2ANetworkRequest):
+        """Create a new agent network"""
+        try:
+            network = await nexus.create_agent_network(request.agents, request.network_id)
+            return network
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @router.post("/networks/{network_id}/broadcast")
+    async def broadcast_to_network(
+        network_id: str,
+        sender: str,
+        message: A2AMessage
+    ):
+        """Broadcast a message to all agents in a network"""
+        try:
+            responses = await nexus.send_network_message(
+                network_id,
+                sender,
+                message.dict()
+            )
+            return {"network_id": network_id, "responses": responses}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @router.post
